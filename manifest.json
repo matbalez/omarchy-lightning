@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "omarchy-lightning",
+  "name": "Lightning wallet",
+  "version": "0.1.0",
+  "author": "Mat Balez",
+  "description": "Bitcoin Lightning wallet in the bar, powered by Lexe",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Lightning wallet",
+    "description": "Balance, receive and send over Lightning",
+    "category": "Finance",
+    "allowMultiple": false
+  }
+}

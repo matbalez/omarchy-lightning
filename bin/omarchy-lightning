@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Lightning wallet backend for the Omarchy bar plugin, built on the Lexe SDK.
+
+Every command prints one JSON object on stdout and exits 0, or prints
+{"error": "..."} and exits 1. The QML plugin only ever talks to this script,
+so the seed and the SDK never enter the shell process.
+
+State lives in ~/.lexe (the SDK's own directory): seedphrase.txt is the wallet.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import venv
+from pathlib import Path
+
+DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "omarchy-lightning"
+VENV = DATA / "venv"
+SDK_SPEC = "lexe-sdk>=0.1.23,<0.2"
+# Written only after signup succeeds, so an interrupted setup is retried
+# instead of being mistaken for a working wallet.
+SIGNED_UP = Path.home() / ".lexe" / ".omarchy-lightning-signed-up"
+
+
+def emit(payload, code=0):
+    print(json.dumps(payload))
+    sys.exit(code)
+
+
+def fail(message):
+    emit({"error": str(message)}, 1)
+
+
+def ensure_sdk():
+    """Re-exec inside a private venv holding the Lexe SDK, creating it once."""
+    try:
+        import lexe  # noqa: F401
+        return
+    except ImportError:
+        pass
+    if os.environ.get("OMARCHY_LIGHTNING_REEXEC"):
+        fail("The Lexe SDK could not be imported after installing it.")
+    python = VENV / "bin" / "python"
+    if not python.exists():
+        venv.EnvBuilder(with_pip=True).create(VENV)
+    probe = subprocess.run([str(python), "-c", "import lexe"], capture_output=True)
+    if probe.returncode != 0:
+        install = subprocess.run(
+            [str(python), "-m", "pip", "install", "--quiet", SDK_SPEC],
+            capture_output=True, text=True)
+        if install.returncode != 0:
+            fail("Installing the Lexe SDK failed: " + install.stderr.strip()[-300:])
+    os.environ["OMARCHY_LIGHTNING_REEXEC"] = "1"
+    os.execv(str(python), [str(python), *sys.argv])
+
+
+def seed_exists(lexe, config):
+    try:
+        lexe.RootSeed.read(config)
+        return True
+    except lexe.SeedFileError.NotFound:
+        return False
+
+
+def open_wallet(lexe, config):
+    if not seed_exists(lexe, config) or not SIGNED_UP.exists():
+        fail("No wallet yet. Create one first.")
+    seed = lexe.RootSeed.read(config)
+    creds = lexe.Credentials.from_root_seed(seed)
+    wallet = lexe.LexeWallet.load_or_fresh(config, creds)
+    return seed, creds, wallet
+
+
+def cmd_status(lexe, config, _args):
+    if not seed_exists(lexe, config):
+        emit({"state": "uninitialized"})
+    if not SIGNED_UP.exists():
+        emit({"state": "uninitialized"})
+    _, creds, wallet = open_wallet(lexe, config)
+    wallet.provision(creds)
+    info = wallet.node_info()
+    emit({
+        "state": "ready",
+        "balance_sats": info.balance_sats,
+        "lightning_balance_sats": info.lightning_balance_sats,
+        "sendable_sats": info.lightning_max_sendable_balance_sats,
+        "usable_channels": info.num_usable_channels,
+    })
+
+
+def cmd_setup(lexe, config, _args):
+    """Create the wallet: generate a seed, keep it on disk, sign up with Lexe."""
+    if seed_exists(lexe, config):
+        seed = lexe.RootSeed.read(config)
+    else:
+        seed = lexe.RootSeed.generate()
+        # The seed is saved before signing up. Signup is idempotent, so a
+        # failure leaves a seed that a retry can finish; the reverse order
+        # could create a node whose key was never written down.
+        seed.write(config)
+    seed_file = Path.home() / ".lexe" / "seedphrase.txt"
+    for path in (seed_file, seed_file.parent):
+        if path.exists():
+            path.chmod(0o700 if path.is_dir() else 0o600)
+    creds = lexe.Credentials.from_root_seed(seed)
+    wallet = lexe.LexeWallet.load_or_fresh(config, creds)
+    wallet.signup(root_seed=seed, partner_pk=None)
+    SIGNED_UP.touch(mode=0o600)
+    emit({"state": "ready"})
+
+
+def cmd_seed(lexe, config, _args):
+    emit({"mnemonic": lexe.RootSeed.read(config).to_mnemonic()})
+
+
+def qr_matrix(text):
+    """Rows of 0/1 modules for the invoice, with a 2-module quiet zone.
+
+    BOLT 11 invoices are case-insensitive, and upper case lets the QR use its
+    denser alphanumeric mode, which scans far better on a laptop screen.
+    """
+    try:
+        out = subprocess.run(["qrencode", "-t", "ASCII", "-m", "2", "-o", "-", text.upper()],
+                             capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    # qrencode's ASCII output draws each module as two characters.
+    return ["".join("1" if line[i] == "#" else "0" for i in range(0, len(line), 2))
+            for line in out.splitlines()]
+
+
+def cmd_invoice(lexe, config, args):
+    _, _, wallet = open_wallet(lexe, config)
+    resp = wallet.create_invoice(
+        expiration_secs=3600,
+        amount_sats=args.amount,
+        description=args.description or None,
+    )
+    emit({"invoice": resp.invoice, "qr": qr_matrix(resp.invoice), "index": resp.index,
+          "amount_sats": resp.amount_sats,
+          "expires_at_ms": resp.expires_at_ms, "payment_hash": resp.payment_hash})
+
+
+def cmd_analyze(lexe, config, args):
+    """Describe what a payment string is and whether it needs an amount."""
+    _, _, wallet = open_wallet(lexe, config)
+    result = wallet.analyze(args.payable)
+    if not result.payables:
+        fail("Not a recognised Bitcoin or Lightning payment.")
+    best = result.payables[0]
+    method = best.method
+    kind = ("invoice" if method.is_INVOICE() else "offer" if method.is_OFFER()
+            else "lnurl" if method.is_LNURL_PAY() else "onchain")
+    emit({
+        "kind": kind,
+        "amount_sats": best.amount_sats,
+        "min_amount_sats": best.min_amount_sats,
+        "max_amount_sats": best.max_amount_sats,
+        "description": best.description,
+        "needs_amount": best.amount_sats is None,
+    })
+
+
+def status_name(payment):
+    """pending | completed | failed, whatever the SDK's enum prints as."""
+    return payment.status.name.lower()
+
+
+def cmd_payment(lexe, config, args):
+    """Status of one payment, for polling after an invoice or a send."""
+    _, _, wallet = open_wallet(lexe, config)
+    wallet.sync_payments()
+    payment = wallet.get_payment(args.index)
+    if payment is None:
+        emit({"status": "pending"})
+    emit({"status": status_name(payment), "amount_sats": payment.amount_sats,
+          "fees_sats": payment.fees_sats, "message": payment.status_msg})
+
+
+def cmd_pay(lexe, config, args):
+    _, _, wallet = open_wallet(lexe, config)
+    analysis = wallet.analyze(args.payable)
+    if not analysis.payables:
+        fail("Not a recognised Bitcoin or Lightning payment.")
+    # A payable that already encodes an amount (most invoices) is paid as
+    # written; a typed amount would only conflict with it.
+    fixed = analysis.payables[0].amount_sats is not None
+    if not fixed and not args.amount:
+        fail("Enter an amount to send.")
+    amount = None if fixed else args.amount
+    payment = wallet.pay(args.payable, amount_sats=amount)
+    emit({"status": status_name(payment), "index": payment.index, "amount_sats": payment.amount_sats,
+          "fees_sats": payment.fees_sats, "message": payment.status_msg})
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="omarchy-lightning")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status")
+    sub.add_parser("setup")
+    sub.add_parser("seed")
+    invoice = sub.add_parser("invoice")
+    invoice.add_argument("--amount", type=int)
+    invoice.add_argument("--description")
+    analyze = sub.add_parser("analyze")
+    analyze.add_argument("payable")
+    payment = sub.add_parser("payment")
+    payment.add_argument("index")
+    pay = sub.add_parser("pay")
+    pay.add_argument("payable")
+    pay.add_argument("--amount", type=int)
+    args = parser.parse_args()
+
+    ensure_sdk()
+    import lexe
+
+    commands = {"status": cmd_status, "setup": cmd_setup, "seed": cmd_seed,
+                "invoice": cmd_invoice, "analyze": cmd_analyze, "pay": cmd_pay,
+                "payment": cmd_payment}
+    try:
+        commands[args.command](lexe, lexe.WalletConfig.mainnet(), args)
+    except SystemExit:
+        raise
+    except Exception as error:  # SDK errors are FfiError; report them verbatim.
+        fail(error)
+
+
+if __name__ == "__main__":
+    main()
